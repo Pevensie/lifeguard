@@ -13,11 +13,13 @@ import gleam/result
 
 // ---- Pool config ----- //
 
+/// The strategy used to check out a resource from the pool.
 pub type CheckoutStrategy {
   FIFO
   LIFO
 }
 
+/// Configuration for a [`Pool`](#Pool).
 pub opaque type PoolConfig(state, msg) {
   PoolConfig(
     size: Int,
@@ -26,10 +28,37 @@ pub opaque type PoolConfig(state, msg) {
   )
 }
 
+/// Create a new [`PoolConfig`](#PoolConfig) for creating a pool of actors.
+///
+/// ```gleam
+/// import lifeguard
+///
+/// pub fn main() {
+///   // Create a pool of 10 connections to some fictional database.
+///   let assert Ok(pool) =
+///     lifeguard.new(
+///       lifeguard.Spec(
+///         init_timeout: 1000,
+///         init: fn(selector) { actor.Ready(state: Nil, selector:) },
+///         loop: fn(msg, state) { actor.continue(state) },
+///       )
+///     )
+///     |> lifeguard.with_size(10)
+///     |> lifeguard.start(1000)
+/// }
+/// ```
+///
+/// ### Default values
+///
+/// | Config | Default |
+/// |--------|---------|
+/// | `size`   | 10      |
+/// | `checkout_strategy` | `FIFO` |
 pub fn new(spec spec: Spec(state, msg)) -> PoolConfig(state, msg) {
   PoolConfig(size: 10, spec:, checkout_strategy: FIFO)
 }
 
+/// Set the number of actors in the pool. Defaults to 10.
 pub fn with_size(
   config pool_config: PoolConfig(state, msg),
   size size: Int,
@@ -37,6 +66,7 @@ pub fn with_size(
   PoolConfig(..pool_config, size:)
 }
 
+/// Set the order in which actors are checked out from the pool. Defaults to `FIFO`.
 pub fn with_checkout_strategy(
   config pool_config: PoolConfig(state, msg),
   strategy checkout_strategy: CheckoutStrategy,
@@ -46,6 +76,7 @@ pub fn with_checkout_strategy(
 
 // ----- Lifecycle functions ---- //
 
+/// An error returned when creating a [`Pool`](#Pool).
 pub type StartError {
   PoolActorStartError(actor.StartError)
   WorkerStartError(actor.StartError)
@@ -53,6 +84,7 @@ pub type StartError {
   WorkerSupervisorStartError(dynamic.Dynamic)
 }
 
+/// An error returned when failing to use a pooled worker.
 pub type ApplyError {
   NoResourcesAvailable
   CheckOutTimeout
@@ -60,6 +92,25 @@ pub type ApplyError {
   WorkerCrashed(dynamic.Dynamic)
 }
 
+/// An actor spec for workers in a pool. Similar to [`actor.Spec`](https://hexdocs.pm/gleam_otp/gleam/otp/actor.html#Spec),
+/// but this provides the initial selector for the actor. It will select on its own
+/// subject by default, using `function.identity` to pass the message straight through.
+///
+/// For clarity, it will be used as follows by Lifeguard:
+///
+/// ```gleam
+/// actor.Spec(init_timeout: spec.init_timeout, loop: spec.loop, init: fn() {
+///   // Check in the worker
+///   let self = process.new_subject()
+///   process.send(pool_subject, Register(self)) // Register the worker with the pool
+///
+///   let selector =
+///     process.new_selector()
+///     |> process.selecting(self, function.identity)
+///
+///   spec.init(selector)
+/// })
+/// ```
 pub type Spec(state, msg) {
   Spec(
     init: fn(process.Selector(msg)) -> actor.InitResult(state, msg),
@@ -68,13 +119,14 @@ pub type Spec(state, msg) {
   )
 }
 
+/// Start a pool supervision tree using the given [`PoolConfig`](#PoolConfig) and return a
+/// [`Pool`](#Pool).
 pub fn start(
   config pool_config: PoolConfig(state, msg),
   timeout init_timeout: Int,
-  // TODO: errors
 ) -> Result(Pool(msg), StartError) {
   // The supervision tree for pools looks like this:
-  // supervisor (probably rest for 1?)
+  // supervisor (rest for one)
   // |        |
   // |        |
   // pool  supervisor (one for one)
@@ -171,46 +223,33 @@ pub fn apply(
   use worker <- result.try(check_out(pool, self, timeout))
 
   let result = next(worker.subject)
-  // Use manual send instead of try_call so we can use the same caller subject
-  // we sent with the check out message
-  // process.send(
-  //   worker_subject,
-  //   UseResource(self, unsafe_coerce_to_dynamic_function(next)),
-  // )
-
-  // let usage_result =
-  //   process.receive(self, timeout)
-  //   |> result.map(fn(result) {
-  //     result
-  //     |> result.map(unsafe_coerce_to_return_type)
-  //     |> result.map_error(WorkerCrashed)
-  //   })
-
-  // let usage_result = case usage_result {
-  //   // Timeout
-  //   Error(Nil) -> Error(WorkerCallTimeout)
-  //   Ok(Error(err)) -> Error(err)
-  //   Ok(Ok(result)) -> Ok(result)
-  // }
 
   check_in(pool, worker, self)
 
   Ok(result)
 }
 
-pub fn send(pool: Pool(msg), msg: msg, timeout: Int) -> Result(Nil, ApplyError) {
-  use subject <- apply(pool, timeout)
+/// Send a message to a pooled actor. Equivalent to `process.send` using a pooled actor.
+pub fn send(
+  pool pool: Pool(msg),
+  msg msg: msg,
+  checkout_timeout checkout_timeout: Int,
+) -> Result(Nil, ApplyError) {
+  use subject <- apply(pool, checkout_timeout)
 
   process.send(subject, msg)
 }
 
+/// Send a message to a pooled actor and wait for a response. Equivalent to `process.call`
+/// using a pooled actor.
 pub fn call(
-  pool: Pool(msg),
-  msg: fn(Subject(return_type)) -> msg,
-  timeout: Int,
+  pool pool: Pool(msg),
+  msg msg: fn(Subject(return_type)) -> msg,
+  checkout_timeout checkout_timeout: Int,
+  call_timeout call_timeout: Int,
 ) -> Result(return_type, ApplyError) {
-  apply(pool, timeout, fn(subject) {
-    process.try_call(subject, msg, timeout)
+  apply(pool, checkout_timeout, fn(subject) {
+    process.try_call(subject, msg, call_timeout)
     |> result.map_error(fn(err) {
       case err {
         process.CallTimeout -> WorkerCallTimeout
@@ -222,18 +261,19 @@ pub fn call(
 }
 
 /// Shut down a pool and all its workers.
-pub fn shutdown(pool: Pool(msg)) {
+pub fn shutdown(pool pool: Pool(msg)) {
   process.send_exit(pool.supervisor)
 }
 
 // ----- Pool ----- //
 
+/// The interface for interacting with a pool of workers in Lifeguard.
 pub opaque type Pool(msg) {
   Pool(subject: Subject(PoolMsg(msg)), supervisor: Pid)
 }
 
-type PoolState(msg) {
-  PoolState(
+type State(msg) {
+  State(
     workers: deque.Deque(Worker(msg)),
     checkout_strategy: CheckoutStrategy,
     live_workers: LiveWorkers(msg),
@@ -260,10 +300,7 @@ type PoolMsg(msg) {
   CallerDown(process.ProcessDown)
 }
 
-fn handle_pool_message(
-  msg: PoolMsg(resource_type),
-  state: PoolState(resource_type),
-) {
+fn handle_pool_message(msg: PoolMsg(resource_type), state: State(resource_type)) {
   // TODO: process monitoring
   case msg {
     Register(worker_subject:) -> {
@@ -277,7 +314,7 @@ fn handle_pool_message(
 
       actor.with_selector(
         actor.continue(
-          PoolState(
+          State(
             ..state,
             workers: deque.push_back(state.workers, new_worker),
             selector:,
@@ -306,7 +343,7 @@ fn handle_pool_message(
 
       actor.with_selector(
         actor.continue(
-          PoolState(..state, workers: new_workers, live_workers:, selector:),
+          State(..state, workers: new_workers, live_workers:, selector:),
         ),
         selector,
       )
@@ -336,7 +373,7 @@ fn handle_pool_message(
           actor.send(reply_to, Ok(worker))
           actor.with_selector(
             actor.continue(
-              PoolState(..state, workers: new_workers, live_workers:, selector:),
+              State(..state, workers: new_workers, live_workers:, selector:),
             ),
             selector,
           )
@@ -368,7 +405,7 @@ fn handle_pool_message(
         Error(_) -> #(state.selector, state.workers, state.live_workers)
       }
       actor.with_selector(
-        actor.continue(PoolState(..state, selector:, live_workers:, workers:)),
+        actor.continue(State(..state, selector:, live_workers:, workers:)),
         selector,
       )
     }
@@ -418,7 +455,7 @@ fn handle_pool_message(
 
       actor.with_selector(
         actor.continue(
-          PoolState(
+          State(
             ..state,
             live_workers:,
             selector:,
@@ -434,7 +471,7 @@ fn handle_pool_message(
 fn pool_spec(
   pool_config: PoolConfig(state, msg),
   init_timeout: Int,
-) -> actor.Spec(PoolState(msg), PoolMsg(msg)) {
+) -> actor.Spec(State(msg), PoolMsg(msg)) {
   actor.Spec(init_timeout:, loop: handle_pool_message, init: fn() {
     let self = process.new_subject()
 
@@ -443,7 +480,7 @@ fn pool_spec(
       |> process.selecting(self, function.identity)
 
     let state =
-      PoolState(
+      State(
         workers: deque.new(),
         checkout_strategy: pool_config.checkout_strategy,
         live_workers: dict.new(),

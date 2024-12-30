@@ -68,7 +68,8 @@ pub fn pool_has_correct_capacity_test() {
     |> lifeguard.start(1000)
 
   // Send a wait message that takes a long time
-  let handle = task.async(fn() { lifeguard.call(pool, Wait(1000, _), 2000) })
+  let handle =
+    task.async(fn() { lifeguard.call(pool, Wait(1000, _), 1000, 2000) })
 
   // Wait to let the other process start
   process.sleep(100)
@@ -106,7 +107,7 @@ pub fn pool_handles_caller_crash_test() {
   logging.configure()
 
   // Ensure the pool still has an available resource
-  lifeguard.call(pool, Wait(10, _), 1000)
+  lifeguard.call(pool, Wait(10, _), 1000, 100)
   |> should.equal(Ok(10))
 
   lifeguard.shutdown(pool)

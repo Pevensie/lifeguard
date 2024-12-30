@@ -56,3 +56,9 @@ Further documentation can be found at <https://hexdocs.pm/lifeguard>.
 gleam run   # Run the project
 gleam test  # Run the tests
 ```
+
+## Inspiration
+
+Lifeguard is inspired by both [poolboy](https://github.com/devinus/poolboy) and
+[puddle](https://github.com/massivefermion/puddle). Thanks to the authors for their
+work!

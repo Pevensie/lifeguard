@@ -1,7 +1,7 @@
 name = "lifeguard"
 version = "1.0.0"
 description = "A simple actor pool for Gleam!"
-licences = ["Apache-2.0"]
+licences = ["MIT"]
 repository = { type = "github", user = "Pevensie", repo = "lifeguard" }
 # links = [{ title = "Website", href = "" }]
 

@@ -34,7 +34,7 @@ pub opaque type PoolConfig(state, msg) {
 /// import lifeguard
 ///
 /// pub fn main() {
-///   // Create a pool of 10 connections to some fictional database.
+///   // Create a pool of 10 actors that do nothing.
 ///   let assert Ok(pool) =
 ///     lifeguard.new(
 ///       lifeguard.Spec(

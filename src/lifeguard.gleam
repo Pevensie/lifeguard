@@ -260,6 +260,11 @@ pub fn call(
   |> result.flatten
 }
 
+/// Send a message to all pooled actors, regardless of checkout status.
+pub fn broadcast(pool pool: Pool(msg), msg msg: msg) -> Nil {
+  process.send(pool.subject, Broadcast(msg))
+}
+
 /// Shut down a pool and all its workers.
 pub fn shutdown(pool pool: Pool(msg)) {
   process.send_exit(pool.supervisor)
@@ -298,6 +303,7 @@ type PoolMsg(msg) {
   CheckOut(reply_to: Subject(Result(Worker(msg), ApplyError)), caller: Pid)
   WorkerDown(process.ProcessDown)
   CallerDown(process.ProcessDown)
+  Broadcast(msg)
 }
 
 fn handle_pool_message(msg: PoolMsg(resource_type), state: State(resource_type)) {
@@ -464,6 +470,20 @@ fn handle_pool_message(msg: PoolMsg(resource_type), state: State(resource_type))
         ),
         selector,
       )
+    }
+    Broadcast(msg_to_send) -> {
+      // Get both checked-in and live workers
+      let workers =
+        list.append(
+          deque.to_list(state.workers),
+          dict.values(state.live_workers)
+            |> list.map(fn(live_worker) { live_worker.worker }),
+        )
+
+      list.each(workers, fn(worker) {
+        process.send(worker.subject, msg_to_send)
+      })
+      actor.continue(state)
     }
   }
 }

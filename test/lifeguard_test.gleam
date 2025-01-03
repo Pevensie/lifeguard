@@ -112,3 +112,14 @@ pub fn pool_handles_caller_crash_test() {
 
   lifeguard.shutdown(pool)
 }
+
+pub fn broadcast_test() {
+  let assert Ok(pool) =
+    lifeguard.new(default_spec())
+    |> lifeguard.with_size(1)
+    |> lifeguard.start(1000)
+
+  lifeguard.broadcast(pool, Send)
+
+  lifeguard.shutdown(pool)
+}

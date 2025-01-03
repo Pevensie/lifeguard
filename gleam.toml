@@ -1,5 +1,5 @@
 name = "lifeguard"
-version = "1.0.0"
+version = "1.1.0"
 description = "A simple actor pool for Gleam!"
 licences = ["MIT"]
 repository = { type = "github", user = "Pevensie", repo = "lifeguard" }

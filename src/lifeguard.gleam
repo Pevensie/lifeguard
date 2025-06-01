@@ -158,7 +158,6 @@ pub fn start(
           |> actor.start_spec
           |> result.map(process.subject_owner)
         })
-          |> sup.timeout(11_000_000)
           |> sup.restart(sup.Transient),
       )
     })
@@ -174,12 +173,10 @@ pub fn start(
       sup.worker_child("pool", fn() {
         process.subject_owner(pool_subject) |> Ok
       })
-        |> sup.timeout(11_000_000)
         |> sup.restart(sup.Transient),
     )
     |> sup.add(
       sup.supervisor_child("worker_supervisor", fn() { Ok(worker_supervisor) })
-      |> sup.timeout(11_000_000)
       |> sup.restart(sup.Transient),
     )
     |> sup.start_link()

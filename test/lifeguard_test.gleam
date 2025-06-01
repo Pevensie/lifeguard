@@ -12,6 +12,11 @@ pub fn main() {
   gleeunit.main()
 }
 
+// Weird hack to change test timeouts, see: https://github.com/lpil/gleeunit/issues/34
+pub type Timeout {
+  Timeout(Float, fn() -> Nil)
+}
+
 type TestMsg {
   Send
   OkCall(reply_to: process.Subject(Result(Nil, Nil)))
@@ -81,6 +86,20 @@ pub fn call_larger_pool_lifecycle_test() {
 
   lifeguard.call(pool, ErrorCall, 1000, 100)
   |> should.equal(Ok(Error(Nil)))
+
+  lifeguard.shutdown(pool)
+}
+
+// Note: the trailing underscore is required to use Timeout
+pub fn call_long_running_job_lifecycle_test_() {
+  use <- Timeout(11_000.0)
+  let assert Ok(pool) =
+    lifeguard.new(default_spec())
+    |> lifeguard.with_size(10)
+    |> lifeguard.start(1000)
+
+  lifeguard.call(pool, Wait(10_000, _), 100, 11_000)
+  |> should.equal(Ok(10_000))
 
   lifeguard.shutdown(pool)
 }

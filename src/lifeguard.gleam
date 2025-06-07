@@ -79,7 +79,6 @@ pub fn with_checkout_strategy(
 /// An error returned when creating a [`Pool`](#Pool).
 pub type StartError {
   PoolActorStartError(actor.StartError)
-  WorkerStartError(actor.StartError)
   PoolSupervisorStartError(dynamic.Dynamic)
   WorkerSupervisorStartError(dynamic.Dynamic)
 }
@@ -121,6 +120,10 @@ pub type Spec(state, msg) {
 
 /// Start a pool supervision tree using the given [`PoolConfig`](#PoolConfig) and return a
 /// [`Pool`](#Pool).
+///
+/// Note: this function mimics the behaviour of `supervisor:start_link` and
+/// `gleam/otp/static_supervisor`'s `start_link` function and will exit the process if
+/// any of the workers fail to start.
 pub fn start(
   config pool_config: PoolConfig(state, msg),
   timeout init_timeout: Int,
@@ -144,31 +147,21 @@ pub fn start(
 
   use pool_subject <- result.try(pool_start_result)
 
-  let workers_result =
-    list.repeat("", pool_config.size)
-    |> list.try_map(fn(_) {
-      use subject <- result.try(
-        actor.start_spec(worker_spec(pool_subject, pool_config.spec))
-        |> result.map_error(WorkerStartError),
-      )
-      Ok(subject)
-    })
-
-  use workers <- result.try(workers_result)
-
   // Add workers to the worker supervisor and start it
   let worker_supervisor_result =
-    workers
-    |> list.index_fold(worker_supervisor, fn(worker_supervisor, actor, idx) {
+    list.repeat("", pool_config.size)
+    |> list.index_fold(worker_supervisor, fn(worker_supervisor, _, idx) {
       sup.add(
         worker_supervisor,
         sup.worker_child("worker_" <> int.to_string(idx), fn() {
-          process.subject_owner(actor) |> Ok
+          worker_spec(pool_subject, pool_config.spec)
+          |> actor.start_spec
+          |> result.map(process.subject_owner)
         })
           |> sup.restart(sup.Transient),
       )
     })
-    |> sup.start_link()
+    |> sup.start_link
     |> result.map_error(WorkerSupervisorStartError)
 
   use worker_supervisor <- result.try(worker_supervisor_result)

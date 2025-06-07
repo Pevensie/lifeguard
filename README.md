@@ -9,7 +9,7 @@ supervised actors without having to manage their lifecycles yourself.
 ## Installation
 
 ```sh
-gleam add lifeguard@1
+gleam add lifeguard@2
 ```
 
 ## Usage

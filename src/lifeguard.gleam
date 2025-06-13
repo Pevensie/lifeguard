@@ -12,47 +12,37 @@ const pool_name_prefix = "lifeguard_pool"
 
 // ---- Pool config ----- //
 
-/// An actor spec for workers in a pool. Similar to [`actor.Spec`](https://hexdocs.pm/gleam_otp/gleam/otp/actor.html#Spec),
-/// but this provides the initial selector for the actor. It will select on its own
-/// subject by default, using `function.identity` to pass the message straight through.
-///
-/// For clarity, it will be used as follows by Lifeguard:
-///
-/// ```gleam
-/// actor.Spec(init_timeout: spec.init_timeout, loop: spec.loop, init: fn() {
-///   // Check in the worker
-///   let self = process.new_subject()
-///   process.send(pool_subject, Register(self)) // Register the worker with the pool
-///
-///   let selector =
-///     process.new_selector()
-///     |> process.selecting(self, function.identity)
-///
-///   spec.init(selector)
-/// })
-/// ```
-// pub type Spec(state, msg) {
-//   Spec(
-//     init: fn(process.Selector(msg)) -> actor.InitResult(state, msg),
-//     init_timeout: Int,
-//     loop: fn(msg, state) -> actor.Next(msg, state),
-//   )
-// }
-
 /// The strategy used to check out a resource from the pool.
 pub type CheckoutStrategy {
+  /// Check out workers with a first-in-first-out strategy. Operates like a queue.
   FIFO
+  /// Check out workers with a last-in-first-out strategy. Operates like a stack.
   LIFO
 }
 
+/// A type returned by a worker's initialisation function. It contains the worker's
+/// initial state, along with an optional selector that can be used to send messages
+/// to the worker.
+///
+/// If provided, the selector will be used instead of the default, which just selects
+/// from the worker's own subject. You can provide a custom selector using the
+/// [`selecting`](#selecting) function.
 pub opaque type Initialised(state, msg) {
   Initialised(state: state, selector: option.Option(process.Selector(msg)))
 }
 
+/// Create a new [`Initialised`](#Initialised) value with the given state and no selector.
 pub fn initialised(state: state) -> Initialised(state, msg) {
   Initialised(state: state, selector: None)
 }
 
+/// Provide a selector for your worker to receive messages with. If your worker receives
+/// a message that isn't selected, the message will be discarded and a warning will be
+/// logged.
+///
+/// If you don't provide a selector, the worker will receive messages from its own subject,
+/// equivalent to `process.select(process.new_selector(), process.new_subject())`. If you
+/// provide a selector, the default selector will be overwritten.
 pub fn selecting(
   initialised: Initialised(state, msg),
   selector: process.Selector(msg),
@@ -61,17 +51,20 @@ pub fn selecting(
 }
 
 /// Configuration for a [`Pool`](#Pool).
-pub opaque type PoolConfig(state, msg) {
-  PoolConfig(
+pub opaque type Builder(state, msg) {
+  Builder(
     size: Int,
     checkout_strategy: CheckoutStrategy,
-    init: fn() -> Result(Initialised(state, msg), String),
+    init: fn(process.Subject(msg)) -> Result(Initialised(state, msg), String),
     init_timeout: Int,
     loop: fn(state, msg) -> actor.Next(state, msg),
   )
 }
 
-/// Create a new [`PoolConfig`](#PoolConfig) for creating a pool of actors.
+/// Create a new [`Builder`](#Builder) for creating a pool of worker actors.
+///
+/// This API mimics the Actor API from [`gleam/otp/actor`](https://hexdocs.pm/gleam_otp/gleam/otp/actor.html),
+/// so it should be familiar to anyone already using OTP with Gleam.
 ///
 /// ```gleam
 /// import lifeguard
@@ -79,14 +72,9 @@ pub opaque type PoolConfig(state, msg) {
 /// pub fn main() {
 ///   // Create a pool of 10 actors that do nothing.
 ///   let assert Ok(pool) =
-///     lifeguard.new(
-///       lifeguard.Spec(
-///         init_timeout: 1000,
-///         init: fn(selector) { actor.Ready(state: Nil, selector:) },
-///         loop: fn(msg, state) { actor.continue(state) },
-///       )
-///     )
-///     |> lifeguard.with_size(10)
+///     lifeguard.new(initial_state)
+///     |> lifeguard.on_message(fn(msg, state) { actor.continue(state) })
+///     |> lifeguard.size(10)
 ///     |> lifeguard.start(1000)
 /// }
 /// ```
@@ -95,23 +83,59 @@ pub opaque type PoolConfig(state, msg) {
 ///
 /// | Config | Default |
 /// |--------|---------|
+/// | `on_message` | `fn(state, _) { actor.continue(state) }` |
 /// | `size`   | 10      |
 /// | `checkout_strategy` | `FIFO` |
-pub fn new(state: state) -> PoolConfig(state, msg) {
-  PoolConfig(
+pub fn new(state: state) -> Builder(state, msg) {
+  Builder(
     size: 10,
     checkout_strategy: FIFO,
-    init: fn() { Ok(initialised(state)) },
+    init: fn(_) { Ok(initialised(state)) },
     init_timeout: 1000,
     loop: fn(state, _) { actor.continue(state) },
   )
 }
 
+/// Create a new [`Builder`](#Builder) with a custom initialiser that runs before the
+/// worker's message loop starts.
+///
+/// The first argument is the number of milliseconds the initialiser is expected to
+/// return within. The actor will be terminated if it does not complete within the
+/// specified time, and the creation of the pool will fail.
+///
+/// The initialiser is given the worker's default subject, which can optionally be
+/// used to create a custom selector for the worker to receive messages. See the
+/// [`selecting`](#selecting) function for more information.
+///
+/// This API mimics the Actor API from [`gleam/otp/actor`](https://hexdocs.pm/gleam_otp/gleam/otp/actor.html),
+/// so it should be familiar to anyone already using OTP with Gleam.
+///
+/// ```gleam
+/// import lifeguard
+///
+/// pub fn main() {
+///   // Create a pool of 10 actors that do nothing.
+///   let assert Ok(pool) =
+///     lifeguard.new(initial_state)
+///     |> lifeguard.on_message(fn(msg, state) { actor.continue(state) })
+///     |> lifeguard.size(10)
+///     |> lifeguard.start(1000)
+/// }
+/// ```
+///
+/// ### Default values
+///
+/// | Config | Default |
+/// |--------|---------|
+/// | `on_message` | `fn(state, _) { actor.continue(state) }` |
+/// | `size`   | 10      |
+/// | `checkout_strategy` | `FIFO` |
 pub fn new_with_initialiser(
   timeout: Int,
-  initialiser: fn() -> Result(Initialised(state, msg), String),
-) -> PoolConfig(state, msg) {
-  PoolConfig(
+  initialiser: fn(process.Subject(msg)) ->
+    Result(Initialised(state, msg), String),
+) -> Builder(state, msg) {
+  Builder(
     size: 10,
     checkout_strategy: FIFO,
     init: initialiser,
@@ -120,27 +144,29 @@ pub fn new_with_initialiser(
   )
 }
 
+/// Set the message handler for actors in the pool. This operates exactly like
+/// [`gleam/otp/actor.on_message`](https://gleam.run/api/gleam/otp/actor/index.html#on_message).
 pub fn on_message(
-  config pool_config: PoolConfig(state, msg),
+  builder builder: Builder(state, msg),
   handler handler: fn(state, msg) -> actor.Next(state, msg),
 ) {
-  PoolConfig(..pool_config, loop: handler)
+  Builder(..builder, loop: handler)
 }
 
 /// Set the number of actors in the pool. Defaults to 10.
-pub fn with_size(
-  config pool_config: PoolConfig(state, msg),
+pub fn size(
+  builder builder: Builder(state, msg),
   size size: Int,
-) -> PoolConfig(state, msg) {
-  PoolConfig(..pool_config, size:)
+) -> Builder(state, msg) {
+  Builder(..builder, size:)
 }
 
 /// Set the order in which actors are checked out from the pool. Defaults to `FIFO`.
-pub fn with_checkout_strategy(
-  config pool_config: PoolConfig(state, msg),
+pub fn checkout_strategy(
+  builder builder: Builder(state, msg),
   strategy checkout_strategy: CheckoutStrategy,
-) -> PoolConfig(state, msg) {
-  PoolConfig(..pool_config, checkout_strategy:)
+) -> Builder(state, msg) {
+  Builder(..builder, checkout_strategy:)
 }
 
 // ----- Lifecycle functions ---- //
@@ -148,10 +174,10 @@ pub fn with_checkout_strategy(
 /// An error returned when failing to use a pooled worker.
 pub type ApplyError {
   NoResourcesAvailable
-  WorkerCrashed(process.Down)
+  // WorkerCrashed(process.Down)
 }
 
-/// Start a pool supervision tree using the given [`PoolConfig`](#PoolConfig) and return a
+/// Start a pool supervision tree using the given [`Builder`](#Builder) and return a
 /// [`Pool`](#Pool).
 ///
 /// Note: this function mimics the behaviour of `supervisor:start_link` and
@@ -159,7 +185,7 @@ pub type ApplyError {
 /// any of the workers fail to start.
 fn start_tree(
   pool_name: process.Name(PoolMsg(msg)),
-  pool_config: PoolConfig(state, msg),
+  builder: Builder(state, msg),
   init_timeout: Int,
 ) -> Result(actor.Started(sup.Supervisor), actor.StartError) {
   // The supervision tree for pools looks like this:
@@ -178,48 +204,73 @@ fn start_tree(
   // Add workers to the worker supervisor
   let worker_supervisor_spec =
     supervision.supervisor(fn() {
-      list.repeat("", pool_config.size)
+      list.repeat("", builder.size)
       |> list.fold(worker_supervisor, fn(worker_supervisor, _) {
-        sup.add(worker_supervisor, worker_spec(pool_name, pool_config))
+        sup.add(worker_supervisor, worker_spec(pool_name, builder))
       })
       |> sup.start
     })
 
   // Add the pool and worker supervisors to the main supervisor
   main_supervisor
-  |> sup.add(pool_spec(pool_config, pool_name, init_timeout))
+  |> sup.add(pool_spec(builder, pool_name, init_timeout))
   |> sup.add(worker_supervisor_spec)
   |> sup.start()
 }
 
-/// Start a pool supervision tree using the given [`PoolConfig`](#PoolConfig) and return a
-/// [`Pool`](#Pool).
+/// Start an unsupervised pool using the given [`Builder`](#Builder) and return a
+/// [`Pool`](#Pool). In most cases, you should use the [`supervised`](#supervised)
+/// function instead.
 ///
 /// Note: this function mimics the behaviour of `supervisor:start_link` and
 /// `gleam/otp/static_supervisor`'s `start_link` function and will exit the process if
 /// any of the workers fail to start.
 pub fn start(
-  config pool_config: PoolConfig(state, msg),
+  builder builder: Builder(state, msg),
   timeout init_timeout: Int,
 ) -> Result(Pool(msg), actor.StartError) {
   let pool_name = process.new_name(pool_name_prefix)
 
-  start_tree(pool_name, pool_config, init_timeout)
+  start_tree(pool_name, builder, init_timeout)
   |> result.replace(Pool(name: pool_name))
 }
 
+/// Return the [`ChildSpecification`](https://hexdocs.pm/gleam_otp/gleam/otp/supervision.html#ChildSpecification)
+/// for creating a supervised worker pool.
+///
+/// You must provide a selector to receive the [`Pool`](#Pool) value representing the
+/// pool once it has started.
+///
+/// ## Example
+///
+/// ```gleam
+/// import gleam/erlang/process
+/// import gleam/otp/static_supervisor as supervisor
+/// import lifeguard
+///
+/// let pool_receiver = process.new_subject()
+///
+/// let assert Ok(_started) =
+///   supervisor.new(supervisor.OneForOne)
+///   |> supervisor.add(
+///     lifeguard.new(state)
+///     |> lifeguard.supervised(pool_receiver, 1000)
+///   )
+///   |> supervisor.start
+///
+/// let assert Ok(pool) =
+///   process.receive(pool_receiver)
+///
+/// let assert Ok(_) = lifeguard.send(pool, Message)
+/// ```
 pub fn supervised(
-  config pool_config: PoolConfig(state, msg),
+  builder builder: Builder(state, msg),
   receive_to pool_subject: process.Subject(Pool(msg)),
   timeout init_timeout: Int,
 ) -> supervision.ChildSpecification(sup.Supervisor) {
   let pool_name = process.new_name(pool_name_prefix)
   supervision.supervisor(fn() {
-    use supervisor <- result.try(start_tree(
-      pool_name,
-      pool_config,
-      init_timeout,
-    ))
+    use supervisor <- result.try(start_tree(pool_name, builder, init_timeout))
 
     process.send(pool_subject, Pool(name: pool_name))
     Ok(supervisor)
@@ -227,6 +278,8 @@ pub fn supervised(
 }
 
 /// Get the supervisor PID for a running pool.
+///
+/// Returns an error if the pool is not running.
 pub fn pid(pool pool: Pool(resource_type)) -> Result(Pid, Nil) {
   process.named(pool.name)
 }
@@ -259,7 +312,12 @@ pub fn apply(
   Ok(result)
 }
 
-/// Send a message to a pooled actor. Equivalent to `process.send` using a pooled actor.
+/// Send a message to a pooled worker. Equivalent to `process.send` using a pooled actor.
+///
+/// ## Panics
+///
+/// Like [`gleam/erlang/process.send`](https://hexdocs.pm/gleam_erlang/gleam/erlang/process.html#send),
+/// this will panic if the pool is not running.
 pub fn send(
   pool pool: Pool(msg),
   msg msg: msg,
@@ -269,28 +327,28 @@ pub fn send(
 }
 
 /// Send a message to a pooled actor and wait for a response. Equivalent to `process.call`
-/// using a pooled actor.
+/// using a pooled worker.
+///
+/// ## Panics
+///
+/// Like [`gleam/erlang/process.call`](https://hexdocs.pm/gleam_erlang/gleam/erlang/process.html#call),
+/// this will panic if the pool is not running, or if the worker crashes while
+/// handling the message.
 pub fn call(
   pool pool: Pool(msg),
   msg msg: fn(Subject(return_type)) -> msg,
   checkout_timeout checkout_timeout: Int,
   call_timeout call_timeout: Int,
 ) -> Result(return_type, ApplyError) {
-  // apply(pool, checkout_timeout, fn(subj) {
-  //   rescue_exits(fn() { process.call(subj, call_timeout, msg) })
-  //   |> echo
-  //   |> result.map_error(WorkerCrashed)
-  // })
-  // |> result.flatten
-
-  apply(pool, checkout_timeout, fn(subj) {
-    call_recover(subj, call_timeout, msg)
-    |> result.map_error(WorkerCrashed)
-  })
-  |> result.flatten
+  apply(pool, checkout_timeout, process.call(_, call_timeout, msg))
 }
 
 /// Send a message to all pooled actors, regardless of checkout status.
+///
+/// ## Panics
+///
+/// Like [`gleam/erlang/process.send`](https://hexdocs.pm/gleam_erlang/gleam/erlang/process.html#send),
+/// this will panic if the pool is not running.
 pub fn broadcast(pool pool: Pool(msg), msg msg: msg) -> Nil {
   process.named_subject(pool.name)
   |> process.send(Broadcast(msg))
@@ -528,7 +586,7 @@ fn handle_pool_message(state: State(resource_type), msg: PoolMsg(resource_type))
 }
 
 fn pool_spec(
-  pool_config: PoolConfig(state, msg),
+  builder: Builder(state, msg),
   pool_name: process.Name(PoolMsg(msg)),
   init_timeout: Int,
 ) -> supervision.ChildSpecification(process.Subject(PoolMsg(msg))) {
@@ -541,7 +599,7 @@ fn pool_spec(
       let state =
         State(
           workers: deque.new(),
-          checkout_strategy: pool_config.checkout_strategy,
+          checkout_strategy: builder.checkout_strategy,
           live_workers: dict.new(),
           selector:,
         )
@@ -566,64 +624,30 @@ type Worker(msg) {
 
 fn worker_spec(
   pool_name: process.Name(PoolMsg(msg)),
-  pool_config: PoolConfig(state, msg),
+  builder: Builder(state, msg),
 ) -> supervision.ChildSpecification(process.Subject(msg)) {
   let worker_builder =
-    actor.new_with_initialiser(pool_config.init_timeout, fn(self) {
+    actor.new_with_initialiser(builder.init_timeout, fn(self) {
       // Check in the worker
       process.send(process.named_subject(pool_name), Register(self))
 
-      use init_data <- result.try(pool_config.init())
+      use init_data <- result.try(builder.init(self))
 
       let selector =
-        process.new_selector()
-        |> process.select(self)
-
-      let selector = case init_data.selector {
-        Some(init_selector) -> process.merge_selector(init_selector, selector)
-        None -> selector
-      }
+        option.unwrap(
+          init_data.selector,
+          // Default self selector
+          process.new_selector()
+            |> process.select(self),
+        )
 
       actor.initialised(init_data.state)
       |> actor.selecting(selector)
       |> actor.returning(self)
       |> Ok
     })
-    |> actor.on_message(pool_config.loop)
+    |> actor.on_message(builder.loop)
 
   supervision.worker(fn() { actor.start(worker_builder) })
   |> supervision.restart(supervision.Transient)
-}
-
-/// This is mostly a copy of the `gleam/erlang/process.call` function but without the
-/// panic on process down.
-fn call_recover(
-  subject: Subject(message),
-  timeout: Int,
-  make_request: fn(Subject(reply)) -> message,
-) -> Result(reply, process.Down) {
-  let reply_subject = process.new_subject()
-  let assert Ok(callee) = process.subject_owner(subject)
-    as "Callee subject had no owner"
-
-  // Monitor the callee process so we can tell if it goes down (meaning we
-  // won't get a reply)
-  let monitor = process.monitor(callee)
-
-  // Send the request to the process over the channel
-  process.send(subject, make_request(reply_subject))
-
-  // Await a reply or handle failure modes (timeout, process down, etc)
-  let reply =
-    process.new_selector()
-    |> process.select_map(reply_subject, Ok)
-    |> process.select_specific_monitor(monitor, Error)
-    |> process.selector_receive(timeout)
-
-  let assert Ok(reply) = reply as "callee did not send reply before timeout"
-
-  // Demonitor the process and close the channels as we're done
-  process.demonitor_process(monitor)
-
-  reply
 }

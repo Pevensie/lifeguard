@@ -1,6 +1,6 @@
 # Changelog
 
-## v3.0.0 - 2025-06-15
+## v3.0.0 - 2025-06-13
 
 Lifeguard has been updated to use the new stable versions of `gleam/erlang` and
 `gleam/otp`. Lifeguard was originally designed to mostly mimic the API of

@@ -1,17 +1,43 @@
-// TODO: change this to be a proper worker pool
 import gleam/deque
 import gleam/dict.{type Dict}
-import gleam/dynamic
 import gleam/erlang/process.{type Pid, type Subject}
-import gleam/function
-import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/otp/static_supervisor as sup
+import gleam/otp/supervision
 import gleam/result
 
+const pool_name_prefix = "lifeguard_pool"
+
 // ---- Pool config ----- //
+
+/// An actor spec for workers in a pool. Similar to [`actor.Spec`](https://hexdocs.pm/gleam_otp/gleam/otp/actor.html#Spec),
+/// but this provides the initial selector for the actor. It will select on its own
+/// subject by default, using `function.identity` to pass the message straight through.
+///
+/// For clarity, it will be used as follows by Lifeguard:
+///
+/// ```gleam
+/// actor.Spec(init_timeout: spec.init_timeout, loop: spec.loop, init: fn() {
+///   // Check in the worker
+///   let self = process.new_subject()
+///   process.send(pool_subject, Register(self)) // Register the worker with the pool
+///
+///   let selector =
+///     process.new_selector()
+///     |> process.selecting(self, function.identity)
+///
+///   spec.init(selector)
+/// })
+/// ```
+// pub type Spec(state, msg) {
+//   Spec(
+//     init: fn(process.Selector(msg)) -> actor.InitResult(state, msg),
+//     init_timeout: Int,
+//     loop: fn(msg, state) -> actor.Next(msg, state),
+//   )
+// }
 
 /// The strategy used to check out a resource from the pool.
 pub type CheckoutStrategy {
@@ -19,12 +45,29 @@ pub type CheckoutStrategy {
   LIFO
 }
 
+pub opaque type Initialised(state, msg) {
+  Initialised(state: state, selector: option.Option(process.Selector(msg)))
+}
+
+pub fn initialised(state: state) -> Initialised(state, msg) {
+  Initialised(state: state, selector: None)
+}
+
+pub fn selecting(
+  initialised: Initialised(state, msg),
+  selector: process.Selector(msg),
+) -> Initialised(state, msg) {
+  Initialised(..initialised, selector: Some(selector))
+}
+
 /// Configuration for a [`Pool`](#Pool).
 pub opaque type PoolConfig(state, msg) {
   PoolConfig(
     size: Int,
-    spec: Spec(state, msg),
     checkout_strategy: CheckoutStrategy,
+    init: fn() -> Result(Initialised(state, msg), String),
+    init_timeout: Int,
+    loop: fn(state, msg) -> actor.Next(state, msg),
   )
 }
 
@@ -54,8 +97,34 @@ pub opaque type PoolConfig(state, msg) {
 /// |--------|---------|
 /// | `size`   | 10      |
 /// | `checkout_strategy` | `FIFO` |
-pub fn new(spec spec: Spec(state, msg)) -> PoolConfig(state, msg) {
-  PoolConfig(size: 10, spec:, checkout_strategy: FIFO)
+pub fn new(state: state) -> PoolConfig(state, msg) {
+  PoolConfig(
+    size: 10,
+    checkout_strategy: FIFO,
+    init: fn() { Ok(initialised(state)) },
+    init_timeout: 1000,
+    loop: fn(state, _) { actor.continue(state) },
+  )
+}
+
+pub fn new_with_initialiser(
+  timeout: Int,
+  initialiser: fn() -> Result(Initialised(state, msg), String),
+) -> PoolConfig(state, msg) {
+  PoolConfig(
+    size: 10,
+    checkout_strategy: FIFO,
+    init: initialiser,
+    init_timeout: timeout,
+    loop: fn(state, _) { actor.continue(state) },
+  )
+}
+
+pub fn on_message(
+  config pool_config: PoolConfig(state, msg),
+  handler handler: fn(state, msg) -> actor.Next(state, msg),
+) {
+  PoolConfig(..pool_config, loop: handler)
 }
 
 /// Set the number of actors in the pool. Defaults to 10.
@@ -76,46 +145,10 @@ pub fn with_checkout_strategy(
 
 // ----- Lifecycle functions ---- //
 
-/// An error returned when creating a [`Pool`](#Pool).
-pub type StartError {
-  PoolActorStartError(actor.StartError)
-  PoolSupervisorStartError(dynamic.Dynamic)
-  WorkerSupervisorStartError(dynamic.Dynamic)
-}
-
 /// An error returned when failing to use a pooled worker.
 pub type ApplyError {
   NoResourcesAvailable
-  CheckOutTimeout
-  WorkerCallTimeout
-  WorkerCrashed(dynamic.Dynamic)
-}
-
-/// An actor spec for workers in a pool. Similar to [`actor.Spec`](https://hexdocs.pm/gleam_otp/gleam/otp/actor.html#Spec),
-/// but this provides the initial selector for the actor. It will select on its own
-/// subject by default, using `function.identity` to pass the message straight through.
-///
-/// For clarity, it will be used as follows by Lifeguard:
-///
-/// ```gleam
-/// actor.Spec(init_timeout: spec.init_timeout, loop: spec.loop, init: fn() {
-///   // Check in the worker
-///   let self = process.new_subject()
-///   process.send(pool_subject, Register(self)) // Register the worker with the pool
-///
-///   let selector =
-///     process.new_selector()
-///     |> process.selecting(self, function.identity)
-///
-///   spec.init(selector)
-/// })
-/// ```
-pub type Spec(state, msg) {
-  Spec(
-    init: fn(process.Selector(msg)) -> actor.InitResult(state, msg),
-    init_timeout: Int,
-    loop: fn(msg, state) -> actor.Next(msg, state),
-  )
+  WorkerCrashed(process.Down)
 }
 
 /// Start a pool supervision tree using the given [`PoolConfig`](#PoolConfig) and return a
@@ -124,10 +157,11 @@ pub type Spec(state, msg) {
 /// Note: this function mimics the behaviour of `supervisor:start_link` and
 /// `gleam/otp/static_supervisor`'s `start_link` function and will exit the process if
 /// any of the workers fail to start.
-pub fn start(
-  config pool_config: PoolConfig(state, msg),
-  timeout init_timeout: Int,
-) -> Result(Pool(msg), StartError) {
+fn start_tree(
+  pool_name: process.Name(PoolMsg(msg)),
+  pool_config: PoolConfig(state, msg),
+  init_timeout: Int,
+) -> Result(actor.Started(sup.Supervisor), actor.StartError) {
   // The supervision tree for pools looks like this:
   // supervisor (rest for one)
   // |        |
@@ -141,55 +175,60 @@ pub fn start(
   let main_supervisor = sup.new(sup.RestForOne)
   let worker_supervisor = sup.new(sup.OneForOne)
 
-  let pool_start_result =
-    actor.start_spec(pool_spec(pool_config, init_timeout))
-    |> result.map_error(PoolActorStartError)
-
-  use pool_subject <- result.try(pool_start_result)
-
-  // Add workers to the worker supervisor and start it
-  let worker_supervisor_result =
-    list.repeat("", pool_config.size)
-    |> list.index_fold(worker_supervisor, fn(worker_supervisor, _, idx) {
-      sup.add(
-        worker_supervisor,
-        sup.worker_child("worker_" <> int.to_string(idx), fn() {
-          worker_spec(pool_subject, pool_config.spec)
-          |> actor.start_spec
-          |> result.map(process.subject_owner)
-        })
-          |> sup.restart(sup.Transient),
-      )
+  // Add workers to the worker supervisor
+  let worker_supervisor_spec =
+    supervision.supervisor(fn() {
+      list.repeat("", pool_config.size)
+      |> list.fold(worker_supervisor, fn(worker_supervisor, _) {
+        sup.add(worker_supervisor, worker_spec(pool_name, pool_config))
+      })
+      |> sup.start
     })
-    |> sup.start_link
-    |> result.map_error(WorkerSupervisorStartError)
-
-  use worker_supervisor <- result.try(worker_supervisor_result)
 
   // Add the pool and worker supervisors to the main supervisor
-  let main_supervisor_result =
-    sup.add(
-      main_supervisor,
-      sup.worker_child("pool", fn() {
-        process.subject_owner(pool_subject) |> Ok
-      })
-        |> sup.restart(sup.Transient),
-    )
-    |> sup.add(
-      sup.supervisor_child("worker_supervisor", fn() { Ok(worker_supervisor) })
-      |> sup.restart(sup.Transient),
-    )
-    |> sup.start_link()
-    |> result.map_error(PoolSupervisorStartError)
+  main_supervisor
+  |> sup.add(pool_spec(pool_config, pool_name, init_timeout))
+  |> sup.add(worker_supervisor_spec)
+  |> sup.start()
+}
 
-  use main_supervisor <- result.try(main_supervisor_result)
+/// Start a pool supervision tree using the given [`PoolConfig`](#PoolConfig) and return a
+/// [`Pool`](#Pool).
+///
+/// Note: this function mimics the behaviour of `supervisor:start_link` and
+/// `gleam/otp/static_supervisor`'s `start_link` function and will exit the process if
+/// any of the workers fail to start.
+pub fn start(
+  config pool_config: PoolConfig(state, msg),
+  timeout init_timeout: Int,
+) -> Result(Pool(msg), actor.StartError) {
+  let pool_name = process.new_name(pool_name_prefix)
 
-  Ok(Pool(subject: pool_subject, supervisor: main_supervisor))
+  start_tree(pool_name, pool_config, init_timeout)
+  |> result.replace(Pool(name: pool_name))
+}
+
+pub fn supervised(
+  config pool_config: PoolConfig(state, msg),
+  receive_to pool_subject: process.Subject(Pool(msg)),
+  timeout init_timeout: Int,
+) -> supervision.ChildSpecification(sup.Supervisor) {
+  let pool_name = process.new_name(pool_name_prefix)
+  supervision.supervisor(fn() {
+    use supervisor <- result.try(start_tree(
+      pool_name,
+      pool_config,
+      init_timeout,
+    ))
+
+    process.send(pool_subject, Pool(name: pool_name))
+    Ok(supervisor)
+  })
 }
 
 /// Get the supervisor PID for a running pool.
-pub fn supervisor(pool pool: Pool(resource_type)) -> Pid {
-  pool.supervisor
+pub fn pid(pool pool: Pool(resource_type)) -> Result(Pid, Nil) {
+  process.named(pool.name)
 }
 
 fn check_out(
@@ -197,13 +236,11 @@ fn check_out(
   caller: Pid,
   timeout: Int,
 ) -> Result(Worker(resource_type), ApplyError) {
-  process.try_call(pool.subject, CheckOut(_, caller:), timeout)
-  |> result.replace_error(CheckOutTimeout)
-  |> result.flatten
+  process.call(process.named_subject(pool.name), timeout, CheckOut(_, caller:))
 }
 
 fn check_in(pool: Pool(msg), worker: Worker(msg), caller: Pid) {
-  process.send(pool.subject, CheckIn(worker:, caller:))
+  process.send(process.named_subject(pool.name), CheckIn(worker:, caller:))
 }
 
 @internal
@@ -228,9 +265,7 @@ pub fn send(
   msg msg: msg,
   checkout_timeout checkout_timeout: Int,
 ) -> Result(Nil, ApplyError) {
-  use subject <- apply(pool, checkout_timeout)
-
-  process.send(subject, msg)
+  apply(pool, checkout_timeout, process.send(_, msg))
 }
 
 /// Send a message to a pooled actor and wait for a response. Equivalent to `process.call`
@@ -241,33 +276,37 @@ pub fn call(
   checkout_timeout checkout_timeout: Int,
   call_timeout call_timeout: Int,
 ) -> Result(return_type, ApplyError) {
-  apply(pool, checkout_timeout, fn(subject) {
-    process.try_call(subject, msg, call_timeout)
-    |> result.map_error(fn(err) {
-      case err {
-        process.CallTimeout -> WorkerCallTimeout
-        process.CalleeDown(reason) -> WorkerCrashed(reason)
-      }
-    })
+  // apply(pool, checkout_timeout, fn(subj) {
+  //   rescue_exits(fn() { process.call(subj, call_timeout, msg) })
+  //   |> echo
+  //   |> result.map_error(WorkerCrashed)
+  // })
+  // |> result.flatten
+
+  apply(pool, checkout_timeout, fn(subj) {
+    call_recover(subj, call_timeout, msg)
+    |> result.map_error(WorkerCrashed)
   })
   |> result.flatten
 }
 
 /// Send a message to all pooled actors, regardless of checkout status.
 pub fn broadcast(pool pool: Pool(msg), msg msg: msg) -> Nil {
-  process.send(pool.subject, Broadcast(msg))
+  process.named_subject(pool.name)
+  |> process.send(Broadcast(msg))
 }
 
-/// Shut down a pool and all its workers.
+/// Shut down a pool and all its workers. Fails if the pool is not currently running.
 pub fn shutdown(pool pool: Pool(msg)) {
-  process.send_exit(pool.supervisor)
+  process.named(pool.name)
+  |> result.map(process.send_exit)
 }
 
 // ----- Pool ----- //
 
 /// The interface for interacting with a pool of workers in Lifeguard.
 pub opaque type Pool(msg) {
-  Pool(subject: Subject(PoolMsg(msg)), supervisor: Pid)
+  Pool(name: process.Name(PoolMsg(msg)))
 }
 
 type State(msg) {
@@ -283,44 +322,48 @@ type LiveWorkers(msg) =
   Dict(Pid, LiveWorker(msg))
 
 type LiveWorker(msg) {
-  LiveWorker(
-    worker: Worker(msg),
-    caller: Pid,
-    caller_monitor: process.ProcessMonitor,
-  )
+  LiveWorker(worker: Worker(msg), caller: Pid, caller_monitor: process.Monitor)
 }
 
 type PoolMsg(msg) {
   Register(worker_subject: Subject(msg))
   CheckIn(worker: Worker(msg), caller: Pid)
   CheckOut(reply_to: Subject(Result(Worker(msg), ApplyError)), caller: Pid)
-  WorkerDown(process.ProcessDown)
-  CallerDown(process.ProcessDown)
+  WorkerDown(process.Down)
+  CallerDown(process.Down)
   Broadcast(msg)
 }
 
-fn handle_pool_message(msg: PoolMsg(resource_type), state: State(resource_type)) {
-  // TODO: process monitoring
+fn handle_pool_message(state: State(resource_type), msg: PoolMsg(resource_type)) {
   case msg {
     Register(worker_subject:) -> {
-      let monitor =
-        process.monitor_process(worker_subject |> process.subject_owner)
-      let selector =
-        state.selector
-        |> process.selecting_process_down(monitor, WorkerDown)
+      // We can't register processes that don't exist, so if subject_owner returns
+      // an Error, we just exit early
 
-      let new_worker = Worker(subject: worker_subject, monitor:)
+      let pid_result =
+        worker_subject
+        |> process.subject_owner
+        |> result.replace_error(actor.continue(state))
 
-      actor.with_selector(
-        actor.continue(
+      case pid_result {
+        Error(_) -> actor.continue(state)
+        Ok(worker_pid) -> {
+          let monitor = process.monitor(worker_pid)
+          let selector =
+            state.selector
+            |> process.select_specific_monitor(monitor, WorkerDown)
+
+          let new_worker = Worker(subject: worker_subject, monitor:)
+
           State(
             ..state,
             workers: deque.push_back(state.workers, new_worker),
             selector:,
-          ),
-        ),
-        selector,
-      )
+          )
+          |> actor.continue
+          |> actor.with_selector(selector)
+        }
+      }
     }
     CheckIn(worker:, caller:) -> {
       // If the checked-in process is a currently live worker, remove it from
@@ -333,19 +376,16 @@ fn handle_pool_message(msg: PoolMsg(resource_type), state: State(resource_type))
         Ok(live_worker) -> {
           process.demonitor_process(live_worker.caller_monitor)
           state.selector
-          |> process.deselecting_process_down(live_worker.caller_monitor)
+          |> process.deselect_specific_monitor(live_worker.caller_monitor)
         }
         Error(_) -> state.selector
       }
 
       let new_workers = deque.push_back(state.workers, worker)
 
-      actor.with_selector(
-        actor.continue(
-          State(..state, workers: new_workers, live_workers:, selector:),
-        ),
-        selector,
-      )
+      State(..state, workers: new_workers, live_workers:, selector:)
+      |> actor.continue
+      |> actor.with_selector(selector)
     }
     CheckOut(reply_to:, caller:) -> {
       // We always push to the back, so for FIFO, we pop front,
@@ -358,10 +398,10 @@ fn handle_pool_message(msg: PoolMsg(resource_type), state: State(resource_type))
       case get_result {
         Ok(#(worker, new_workers)) -> {
           // Start monitoring the caller
-          let caller_monitor = process.monitor_process(caller)
+          let caller_monitor = process.monitor(caller)
           let selector =
             state.selector
-            |> process.selecting_process_down(caller_monitor, CallerDown)
+            |> process.select_specific_monitor(caller_monitor, CallerDown)
 
           let live_workers =
             dict.insert(
@@ -369,13 +409,12 @@ fn handle_pool_message(msg: PoolMsg(resource_type), state: State(resource_type))
               caller,
               LiveWorker(worker:, caller:, caller_monitor:),
             )
+
           actor.send(reply_to, Ok(worker))
-          actor.with_selector(
-            actor.continue(
-              State(..state, workers: new_workers, live_workers:, selector:),
-            ),
-            selector,
-          )
+
+          State(..state, workers: new_workers, live_workers:, selector:)
+          |> actor.continue
+          |> actor.with_selector(selector)
         }
         Error(_) -> {
           actor.send(reply_to, Error(NoResourcesAvailable))
@@ -387,15 +426,19 @@ fn handle_pool_message(msg: PoolMsg(resource_type), state: State(resource_type))
       // If the process existed in the live workers dict (i.e. it had a checked out
       // worker), demonitor it and delete it from the dict. Return the worker to the
       // pool.
+
+      // This is safe as we don't monitor ports
+      let assert process.ProcessDown(pid: caller_pid, ..) = process_down
+
       let #(selector, workers, live_workers) = case
-        dict.get(state.live_workers, process_down.pid)
+        dict.get(state.live_workers, caller_pid)
       {
         Ok(live_worker) -> {
-          let live_workers = dict.delete(state.live_workers, process_down.pid)
+          let live_workers = dict.delete(state.live_workers, caller_pid)
           process.demonitor_process(live_worker.caller_monitor)
           let selector =
             state.selector
-            |> process.deselecting_process_down(live_worker.caller_monitor)
+            |> process.deselect_specific_monitor(live_worker.caller_monitor)
 
           let new_workers = deque.push_back(state.workers, live_worker.worker)
 
@@ -409,12 +452,15 @@ fn handle_pool_message(msg: PoolMsg(resource_type), state: State(resource_type))
       )
     }
     WorkerDown(process_down) -> {
+      // This is safe as we don't monitor ports
+      let assert process.ProcessDown(pid: worker_pid, ..) = process_down
+
       // Get this worker from the pool if it was a checked in worker
       let #(maybe_downed_worker, new_workers) =
         state.workers
         |> deque.to_list
         |> list.partition(fn(worker) {
-          process.subject_owner(worker.subject) == process_down.pid
+          process.subject_owner(worker.subject) == Ok(worker_pid)
         })
 
       // Otherwise, it may have been a live worker, so grab it
@@ -424,7 +470,7 @@ fn handle_pool_message(msg: PoolMsg(resource_type), state: State(resource_type))
           case
             dict.values(state.live_workers)
             |> list.find(fn(lw) {
-              process.subject_owner(lw.worker.subject) == process_down.pid
+              process.subject_owner(lw.worker.subject) == Ok(worker_pid)
             })
           {
             Ok(live_worker) -> #(
@@ -447,7 +493,7 @@ fn handle_pool_message(msg: PoolMsg(resource_type), state: State(resource_type))
           process.demonitor_process(worker.monitor)
 
           state.selector
-          |> process.deselecting_process_down(worker.monitor)
+          |> process.deselect_specific_monitor(worker.monitor)
         }
         _ -> state.selector
       }
@@ -483,46 +529,101 @@ fn handle_pool_message(msg: PoolMsg(resource_type), state: State(resource_type))
 
 fn pool_spec(
   pool_config: PoolConfig(state, msg),
+  pool_name: process.Name(PoolMsg(msg)),
   init_timeout: Int,
-) -> actor.Spec(State(msg), PoolMsg(msg)) {
-  actor.Spec(init_timeout:, loop: handle_pool_message, init: fn() {
-    let self = process.new_subject()
+) -> supervision.ChildSpecification(process.Subject(PoolMsg(msg))) {
+  let pool_builder =
+    actor.new_with_initialiser(init_timeout, fn(self) {
+      let selector =
+        process.new_selector()
+        |> process.select(self)
 
-    let selector =
-      process.new_selector()
-      |> process.selecting(self, function.identity)
+      let state =
+        State(
+          workers: deque.new(),
+          checkout_strategy: pool_config.checkout_strategy,
+          live_workers: dict.new(),
+          selector:,
+        )
 
-    let state =
-      State(
-        workers: deque.new(),
-        checkout_strategy: pool_config.checkout_strategy,
-        live_workers: dict.new(),
-        selector:,
-      )
+      actor.initialised(state)
+      |> actor.selecting(selector)
+      |> actor.returning(self)
+      |> Ok
+    })
+    |> actor.on_message(handle_pool_message)
+    |> actor.named(pool_name)
 
-    actor.Ready(state, selector)
-  })
+  supervision.worker(fn() { actor.start(pool_builder) })
+  |> supervision.restart(supervision.Transient)
 }
 
 // ----- Worker ---- //
 
 type Worker(msg) {
-  Worker(subject: Subject(msg), monitor: process.ProcessMonitor)
+  Worker(subject: Subject(msg), monitor: process.Monitor)
 }
 
 fn worker_spec(
-  pool_subject: Subject(PoolMsg(msg)),
-  spec: Spec(state, msg),
-) -> actor.Spec(state, msg) {
-  actor.Spec(init_timeout: spec.init_timeout, loop: spec.loop, init: fn() {
-    // Check in the worker
-    let self = process.new_subject()
-    process.send(pool_subject, Register(self))
+  pool_name: process.Name(PoolMsg(msg)),
+  pool_config: PoolConfig(state, msg),
+) -> supervision.ChildSpecification(process.Subject(msg)) {
+  let worker_builder =
+    actor.new_with_initialiser(pool_config.init_timeout, fn(self) {
+      // Check in the worker
+      process.send(process.named_subject(pool_name), Register(self))
 
-    let selector =
-      process.new_selector()
-      |> process.selecting(self, function.identity)
+      use init_data <- result.try(pool_config.init())
 
-    spec.init(selector)
-  })
+      let selector =
+        process.new_selector()
+        |> process.select(self)
+
+      let selector = case init_data.selector {
+        Some(init_selector) -> process.merge_selector(init_selector, selector)
+        None -> selector
+      }
+
+      actor.initialised(init_data.state)
+      |> actor.selecting(selector)
+      |> actor.returning(self)
+      |> Ok
+    })
+    |> actor.on_message(pool_config.loop)
+
+  supervision.worker(fn() { actor.start(worker_builder) })
+  |> supervision.restart(supervision.Transient)
+}
+
+/// This is mostly a copy of the `gleam/erlang/process.call` function but without the
+/// panic on process down.
+fn call_recover(
+  subject: Subject(message),
+  timeout: Int,
+  make_request: fn(Subject(reply)) -> message,
+) -> Result(reply, process.Down) {
+  let reply_subject = process.new_subject()
+  let assert Ok(callee) = process.subject_owner(subject)
+    as "Callee subject had no owner"
+
+  // Monitor the callee process so we can tell if it goes down (meaning we
+  // won't get a reply)
+  let monitor = process.monitor(callee)
+
+  // Send the request to the process over the channel
+  process.send(subject, make_request(reply_subject))
+
+  // Await a reply or handle failure modes (timeout, process down, etc)
+  let reply =
+    process.new_selector()
+    |> process.select_map(reply_subject, Ok)
+    |> process.select_specific_monitor(monitor, Error)
+    |> process.selector_receive(timeout)
+
+  let assert Ok(reply) = reply as "callee did not send reply before timeout"
+
+  // Demonitor the process and close the channels as we're done
+  process.demonitor_process(monitor)
+
+  reply
 }

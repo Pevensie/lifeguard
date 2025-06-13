@@ -1,5 +1,5 @@
 name = "lifeguard"
-version = "2.0.0"
+version = "3.0.0"
 description = "A simple actor pool for Gleam!"
 licences = ["MIT"]
 repository = { type = "github", user = "Pevensie", repo = "lifeguard" }
@@ -8,8 +8,8 @@ repository = { type = "github", user = "Pevensie", repo = "lifeguard" }
 [dependencies]
 gleam_stdlib = ">= 0.60.0 and < 2.0.0"
 gleam_deque = ">= 1.0.0 and < 2.0.0"
-gleam_erlang = ">= 0.34.0 and < 1.0.0"
-gleam_otp = ">= 0.16.1 and < 1.0.0"
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
+gleam_otp = ">= 1.0.0 and < 2.0.0"
 
 [dev-dependencies]
 gleeunit = ">= 1.4.0 and < 2.0.0"

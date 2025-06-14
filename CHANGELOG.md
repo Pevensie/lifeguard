@@ -69,12 +69,12 @@ pub fn main() {
 
 #### Panics
 
-Like the new version of `gleam/erlang`, calling or sending messages to Lifeguard
-workers will now panic rather than returning an error result?
+Like the new version of `gleam/erlang`, failing to call or send messages to Lifeguard
+workers will now panic rather than returning an error result.
 
 ##### Why?
 
-Previously, Lifeguard used the `process.try_call` function that was presend in
+Previously, Lifeguard used the `process.try_call` function that was present in
 `gleam/erlang`. However, this had the potential to cause a memory leak if the
 worker did not return within the provided timeout.
 

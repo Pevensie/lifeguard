@@ -43,72 +43,62 @@ fn default_handle(_state: Nil, msg: TestMsg) {
   }
 }
 
-fn new_default() {
-  lifeguard.new(Nil)
-  |> lifeguard.on_message(default_handle)
-  |> lifeguard.size(1)
+fn builder_and_pool(size) {
+  let pool_name = process.new_name("lifeguard_pool")
+  let builder =
+    lifeguard.new(pool_name, Nil)
+    |> lifeguard.on_message(default_handle)
+    |> lifeguard.size(size)
+
+  #(builder, process.named_subject(pool_name))
+}
+
+fn get_test_pool(size, next) {
+  let #(builder, pool) = builder_and_pool(size)
+  let assert Ok(_) =
+    builder
+    |> lifeguard.start(1000)
+
+  let res = next(pool)
+  let assert Ok(_) = lifeguard.shutdown(pool)
+  res
 }
 
 pub fn send_lifecycle_test() {
-  let assert Ok(pool) =
-    new_default()
-    |> lifeguard.start(1000)
+  use pool <- get_test_pool(1)
 
   assert lifeguard.send(pool, Send, 1000) == Ok(Nil)
-
-  lifeguard.shutdown(pool)
 }
 
 pub fn call_lifecycle_test() {
-  let assert Ok(pool) =
-    new_default()
-    |> lifeguard.start(1000)
+  use pool <- get_test_pool(1)
 
   assert lifeguard.call(pool, OkCall, 1000, 1000) == Ok(Ok(Nil))
-
-  lifeguard.shutdown(pool)
 }
 
 pub fn call_larger_pool_lifecycle_test() {
-  let assert Ok(pool) =
-    new_default()
-    |> lifeguard.size(10)
-    |> lifeguard.start(1000)
+  use pool <- get_test_pool(10)
 
   assert lifeguard.call(pool, ErrorCall, 1000, 100) == Ok(Error(Nil))
-
-  lifeguard.shutdown(pool)
 }
 
 // Note: the trailing underscore is required to use Timeout
 pub fn call_long_running_job_lifecycle_test_() {
   use <- Timeout(11_000.0)
-  let assert Ok(pool) =
-    new_default()
-    |> lifeguard.size(10)
-    |> lifeguard.start(1000)
+  use pool <- get_test_pool(1)
 
   assert lifeguard.call(pool, Wait(10_000, _), 100, 11_000) == Ok(10_000)
-
-  assert lifeguard.shutdown(pool) == Ok(Nil)
 }
 
 pub fn empty_pool_fails_to_apply_test() {
-  let assert Ok(pool) =
-    new_default()
-    |> lifeguard.size(0)
-    |> lifeguard.start(1000)
+  use pool <- get_test_pool(0)
 
   assert lifeguard.send(pool, Send, 1000)
     == Error(lifeguard.NoResourcesAvailable)
-
-  assert lifeguard.shutdown(pool) == Ok(Nil)
 }
 
 pub fn pool_has_correct_capacity_test() {
-  let assert Ok(pool) =
-    new_default()
-    |> lifeguard.start(1000)
+  use pool <- get_test_pool(1)
 
   // Send a wait message that takes a long time
   let self = process.new_subject()
@@ -125,15 +115,10 @@ pub fn pool_has_correct_capacity_test() {
 
   // Wait for the other process to finish
   assert process.receive(self, 1000) == Ok(Ok(1000))
-
-  assert lifeguard.shutdown(pool) == Ok(Nil)
 }
 
 pub fn workers_can_be_called_concurrently_test() {
-  let assert Ok(pool) =
-    new_default()
-    |> lifeguard.size(2)
-    |> lifeguard.start(1000)
+  use pool <- get_test_pool(2)
 
   // Send a wait message that takes a long time
   let self = process.new_subject()
@@ -148,14 +133,10 @@ pub fn workers_can_be_called_concurrently_test() {
 
   // Wait for the other process to finish
   assert process.receive(self, 1100) == Ok(Ok(1000))
-
-  assert lifeguard.shutdown(pool) == Ok(Nil)
 }
 
 pub fn pool_handles_caller_crash_test() {
-  let assert Ok(pool) =
-    new_default()
-    |> lifeguard.start(1000)
+  use pool <- get_test_pool(1)
 
   // Expect an error message here
   logging.set_level(logging.Critical)
@@ -172,17 +153,10 @@ pub fn pool_handles_caller_crash_test() {
 
   // Ensure the pool still has an available resource
   assert lifeguard.call(pool, Wait(10, _), 1000, 100) == Ok(10)
-
-  assert lifeguard.shutdown(pool) == Ok(Nil)
 }
 
 pub fn broadcast_test() {
-  let assert Ok(pool) =
-    new_default()
-    |> lifeguard.size(5)
-    |> lifeguard.start(1000)
+  use pool <- get_test_pool(5)
 
   lifeguard.broadcast(pool, Send)
-
-  assert lifeguard.shutdown(pool) == Ok(Nil)
 }

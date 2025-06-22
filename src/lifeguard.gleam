@@ -8,8 +8,6 @@ import gleam/otp/static_supervisor as sup
 import gleam/otp/supervision
 import gleam/result
 
-const pool_name_prefix = "lifeguard_pool"
-
 // ---- Pool config ----- //
 
 /// The strategy used to check out a resource from the pool.
@@ -53,6 +51,7 @@ pub fn selecting(
 /// Configuration for a [`Pool`](#Pool).
 pub opaque type Builder(state, msg) {
   Builder(
+    name: process.Name(PoolMsg(msg)),
     size: Int,
     checkout_strategy: CheckoutStrategy,
     init: fn(process.Subject(msg)) -> Result(Initialised(state, msg), String),
@@ -66,13 +65,18 @@ pub opaque type Builder(state, msg) {
 /// This API mimics the Actor API from [`gleam/otp/actor`](https://hexdocs.pm/gleam_otp/gleam/otp/actor.html),
 /// so it should be familiar to anyone already using OTP with Gleam.
 ///
+/// You must provide a name for the pool. You can then send messages to the pool by
+/// creating a named subject with this name.
+///
 /// ```gleam
 /// import lifeguard
 ///
 /// pub fn main() {
+///   let pool_name = process.new_name("pool")
+///
 ///   // Create a pool of 10 actors that do nothing.
 ///   let assert Ok(pool) =
-///     lifeguard.new(initial_state)
+///     lifeguard.new(pool_name, initial_state)
 ///     |> lifeguard.on_message(fn(msg, state) { actor.continue(state) })
 ///     |> lifeguard.size(10)
 ///     |> lifeguard.start(1000)
@@ -86,8 +90,12 @@ pub opaque type Builder(state, msg) {
 /// | `on_message` | `fn(state, _) { actor.continue(state) }` |
 /// | `size`   | 10      |
 /// | `checkout_strategy` | `FIFO` |
-pub fn new(state: state) -> Builder(state, msg) {
+pub fn new(
+  name: process.Name(PoolMsg(msg)),
+  state: state,
+) -> Builder(state, msg) {
   Builder(
+    name:,
     size: 10,
     checkout_strategy: FIFO,
     init: fn(_) { Ok(initialised(state)) },
@@ -99,7 +107,10 @@ pub fn new(state: state) -> Builder(state, msg) {
 /// Create a new [`Builder`](#Builder) with a custom initialiser that runs before the
 /// worker's message loop starts.
 ///
-/// The first argument is the number of milliseconds the initialiser is expected to
+/// You must provide a name for the pool. You can then send messages to the pool by
+/// creating a named subject with this name.
+///
+/// The second argument is the number of milliseconds the initialiser is expected to
 /// return within. The actor will be terminated if it does not complete within the
 /// specified time, and the creation of the pool will fail.
 ///
@@ -110,19 +121,6 @@ pub fn new(state: state) -> Builder(state, msg) {
 /// This API mimics the Actor API from [`gleam/otp/actor`](https://hexdocs.pm/gleam_otp/gleam/otp/actor.html),
 /// so it should be familiar to anyone already using OTP with Gleam.
 ///
-/// ```gleam
-/// import lifeguard
-///
-/// pub fn main() {
-///   // Create a pool of 10 actors that do nothing.
-///   let assert Ok(pool) =
-///     lifeguard.new(initial_state)
-///     |> lifeguard.on_message(fn(msg, state) { actor.continue(state) })
-///     |> lifeguard.size(10)
-///     |> lifeguard.start(1000)
-/// }
-/// ```
-///
 /// ### Default values
 ///
 /// | Config | Default |
@@ -131,11 +129,13 @@ pub fn new(state: state) -> Builder(state, msg) {
 /// | `size`   | 10      |
 /// | `checkout_strategy` | `FIFO` |
 pub fn new_with_initialiser(
+  name: process.Name(PoolMsg(msg)),
   timeout: Int,
   initialiser: fn(process.Subject(msg)) ->
     Result(Initialised(state, msg), String),
 ) -> Builder(state, msg) {
   Builder(
+    name:,
     size: 10,
     checkout_strategy: FIFO,
     init: initialiser,
@@ -177,14 +177,7 @@ pub type ApplyError {
   // WorkerCrashed(process.Down)
 }
 
-/// Start a pool supervision tree using the given [`Builder`](#Builder) and return a
-/// [`Pool`](#Pool).
-///
-/// Note: this function mimics the behaviour of `supervisor:start_link` and
-/// `gleam/otp/static_supervisor`'s `start_link` function and will exit the process if
-/// any of the workers fail to start.
 fn start_tree(
-  pool_name: process.Name(PoolMsg(msg)),
   builder: Builder(state, msg),
   init_timeout: Int,
 ) -> Result(actor.Started(sup.Supervisor), actor.StartError) {
@@ -206,21 +199,21 @@ fn start_tree(
     supervision.supervisor(fn() {
       list.repeat("", builder.size)
       |> list.fold(worker_supervisor, fn(worker_supervisor, _) {
-        sup.add(worker_supervisor, worker_spec(pool_name, builder))
+        sup.add(worker_supervisor, worker_spec(builder))
       })
       |> sup.start
     })
 
   // Add the pool and worker supervisors to the main supervisor
   main_supervisor
-  |> sup.add(pool_spec(builder, pool_name, init_timeout))
+  |> sup.add(pool_spec(builder, init_timeout))
   |> sup.add(worker_supervisor_spec)
   |> sup.start()
 }
 
-/// Start an unsupervised pool using the given [`Builder`](#Builder) and return a
-/// [`Pool`](#Pool). In most cases, you should use the [`supervised`](#supervised)
-/// function instead.
+/// Start an unsupervised pool using the given [`Builder`](#Builder). You can then send
+/// messages to the pool by creating a named subject. In most cases, you should use the
+/// [`supervised`](#supervised) function instead.
 ///
 /// Note: this function mimics the behaviour of `supervisor:start_link` and
 /// `gleam/otp/static_supervisor`'s `start_link` function and will exit the process if
@@ -228,79 +221,66 @@ fn start_tree(
 pub fn start(
   builder builder: Builder(state, msg),
   timeout init_timeout: Int,
-) -> Result(Pool(msg), actor.StartError) {
-  let pool_name = process.new_name(pool_name_prefix)
-
-  start_tree(pool_name, builder, init_timeout)
-  |> result.replace(Pool(name: pool_name))
+) -> Result(sup.Supervisor, actor.StartError) {
+  start_tree(builder, init_timeout)
+  |> result.map(fn(started) { started.data })
 }
 
 /// Return the [`ChildSpecification`](https://hexdocs.pm/gleam_otp/gleam/otp/supervision.html#ChildSpecification)
 /// for creating a supervised worker pool.
 ///
-/// You must provide a selector to receive the [`Pool`](#Pool) value representing the
-/// pool once it has started.
-///
 /// ## Example
 ///
 /// ```gleam
-/// // Create a subject to receive the pool handler once the supervision tree has been
-/// // started. Use a named subject to make sure we can always receive the pool handler,
-/// // even if our original process crashes.
-/// let pool_receiver_name = process.new_name("lifeguard_pool_receiver")
-/// let assert Ok(_) = process.register(process.self(), pool_receiver_name)
-///
-/// let pool_receiver = process.named_subject(pool_receiver_name)
+/// // Create a name for the pool. We can use this to send messages to the pool once it
+/// // has been started.
+/// let pool_name = process.new_name("db_connection_pool")
 ///
 /// let assert Ok(_started) =
 ///   supervisor.new(supervisor.OneForOne)
 ///   |> supervisor.add(
-///     lifeguard.new(state)
-///     |> lifeguard.supervised(pool_receiver, 1000)
+///     lifeguard.new(pool_name, state)
+///     |> lifeguard.supervised(1000)
 ///   )
 ///   |> supervisor.start
 ///
-/// let assert Ok(pool) =
-///   process.receive(pool_receiver)
+/// let pool = process.named_subject(pool_name)
 ///
 /// let assert Ok(_) = lifeguard.send(pool, Message)
 /// ```
 pub fn supervised(
   builder builder: Builder(state, msg),
-  receive_to pool_subject: process.Subject(Pool(msg)),
   timeout init_timeout: Int,
 ) -> supervision.ChildSpecification(sup.Supervisor) {
-  let pool_name = process.new_name(pool_name_prefix)
-  supervision.supervisor(fn() {
-    use supervisor <- result.try(start_tree(pool_name, builder, init_timeout))
-
-    process.send(pool_subject, Pool(name: pool_name))
-    Ok(supervisor)
-  })
+  supervision.supervisor(fn() { start_tree(builder, init_timeout) })
 }
 
 /// Get the supervisor PID for a running pool.
 ///
 /// Returns an error if the pool is not running.
-pub fn pid(pool pool: Pool(resource_type)) -> Result(Pid, Nil) {
-  process.named(pool.name)
+pub fn pid(pool pool: process.Subject(PoolMsg(msg))) -> Result(Pid, Nil) {
+  process.subject_owner(pool)
 }
 
 fn check_out(
-  pool: Pool(resource_type),
+  pool: process.Subject(PoolMsg(msg)),
   caller: Pid,
   timeout: Int,
-) -> Result(Worker(resource_type), ApplyError) {
-  process.call(process.named_subject(pool.name), timeout, CheckOut(_, caller:))
+) -> Result(Worker(msg), ApplyError) {
+  process.call(pool, timeout, CheckOut(_, caller:))
 }
 
-fn check_in(pool: Pool(msg), worker: Worker(msg), caller: Pid) {
-  process.send(process.named_subject(pool.name), CheckIn(worker:, caller:))
+fn check_in(
+  pool: process.Subject(PoolMsg(msg)),
+  worker: Worker(msg),
+  caller: Pid,
+) {
+  process.send(pool, CheckIn(worker:, caller:))
 }
 
 @internal
 pub fn apply(
-  pool: Pool(msg),
+  pool: process.Subject(PoolMsg(msg)),
   timeout: Int,
   next: fn(Subject(msg)) -> result_type,
 ) -> Result(result_type, ApplyError) {
@@ -321,7 +301,7 @@ pub fn apply(
 /// Like [`gleam/erlang/process.send`](https://hexdocs.pm/gleam_erlang/gleam/erlang/process.html#send),
 /// this will panic if the pool is not running.
 pub fn send(
-  pool pool: Pool(msg),
+  pool pool: process.Subject(PoolMsg(msg)),
   msg msg: msg,
   checkout_timeout checkout_timeout: Int,
 ) -> Result(Nil, ApplyError) {
@@ -337,7 +317,7 @@ pub fn send(
 /// this will panic if the pool is not running, or if the worker crashes while
 /// handling the message.
 pub fn call(
-  pool pool: Pool(msg),
+  pool pool: process.Subject(PoolMsg(msg)),
   msg msg: fn(Subject(return_type)) -> msg,
   checkout_timeout checkout_timeout: Int,
   call_timeout call_timeout: Int,
@@ -351,26 +331,20 @@ pub fn call(
 ///
 /// Like [`gleam/erlang/process.send`](https://hexdocs.pm/gleam_erlang/gleam/erlang/process.html#send),
 /// this will panic if the pool is not running.
-pub fn broadcast(pool pool: Pool(msg), msg msg: msg) -> Nil {
-  process.named_subject(pool.name)
-  |> process.send(Broadcast(msg))
+pub fn broadcast(pool pool: process.Subject(PoolMsg(msg)), msg msg: msg) -> Nil {
+  process.send(pool, Broadcast(msg))
 }
 
 /// Shut down a pool and all its workers. Fails if the pool is not currently running.
 ///
 /// You only need to call this when using unsupervised pools. You should let your
 /// supervision tree handle the shutdown of supervised worker pools.
-pub fn shutdown(pool pool: Pool(msg)) {
-  process.named(pool.name)
+pub fn shutdown(pool pool: process.Subject(PoolMsg(msg))) {
+  pid(pool)
   |> result.map(process.send_exit)
 }
 
 // ----- Pool ----- //
-
-/// The interface for interacting with a pool of workers in Lifeguard.
-pub opaque type Pool(msg) {
-  Pool(name: process.Name(PoolMsg(msg)))
-}
 
 type State(msg) {
   State(
@@ -388,7 +362,7 @@ type LiveWorker(msg) {
   LiveWorker(worker: Worker(msg), caller: Pid, caller_monitor: process.Monitor)
 }
 
-type PoolMsg(msg) {
+pub opaque type PoolMsg(msg) {
   Register(worker_subject: Subject(msg))
   CheckIn(worker: Worker(msg), caller: Pid)
   CheckOut(reply_to: Subject(Result(Worker(msg), ApplyError)), caller: Pid)
@@ -397,7 +371,7 @@ type PoolMsg(msg) {
   Broadcast(msg)
 }
 
-fn handle_pool_message(state: State(resource_type), msg: PoolMsg(resource_type)) {
+fn handle_pool_message(state: State(msg), msg: PoolMsg(msg)) {
   case msg {
     Register(worker_subject:) -> {
       // We can't register processes that don't exist, so if subject_owner returns
@@ -592,7 +566,6 @@ fn handle_pool_message(state: State(resource_type), msg: PoolMsg(resource_type))
 
 fn pool_spec(
   builder: Builder(state, msg),
-  pool_name: process.Name(PoolMsg(msg)),
   init_timeout: Int,
 ) -> supervision.ChildSpecification(process.Subject(PoolMsg(msg))) {
   let pool_builder =
@@ -615,7 +588,7 @@ fn pool_spec(
       |> Ok
     })
     |> actor.on_message(handle_pool_message)
-    |> actor.named(pool_name)
+    |> actor.named(builder.name)
 
   supervision.worker(fn() { actor.start(pool_builder) })
   |> supervision.restart(supervision.Transient)
@@ -628,13 +601,12 @@ type Worker(msg) {
 }
 
 fn worker_spec(
-  pool_name: process.Name(PoolMsg(msg)),
   builder: Builder(state, msg),
 ) -> supervision.ChildSpecification(process.Subject(msg)) {
   let worker_builder =
     actor.new_with_initialiser(builder.init_timeout, fn(self) {
       // Check in the worker
-      process.send(process.named_subject(pool_name), Register(self))
+      process.send(process.named_subject(builder.name), Register(self))
 
       use init_data <- result.try(builder.init(self))
 

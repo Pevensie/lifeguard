@@ -244,10 +244,6 @@ pub fn start(
 /// ## Example
 ///
 /// ```gleam
-/// import gleam/erlang/process
-/// import gleam/otp/static_supervisor as supervisor
-/// import lifeguard
-///
 /// let pool_receiver = process.new_subject()
 ///
 /// let assert Ok(_started) =
@@ -355,6 +351,9 @@ pub fn broadcast(pool pool: Pool(msg), msg msg: msg) -> Nil {
 }
 
 /// Shut down a pool and all its workers. Fails if the pool is not currently running.
+///
+/// You only need to call this when using unsupervised pools. You should let your
+/// supervision tree handle the shutdown of supervised worker pools.
 pub fn shutdown(pool pool: Pool(msg)) {
   process.named(pool.name)
   |> result.map(process.send_exit)

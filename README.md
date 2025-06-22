@@ -55,8 +55,7 @@ pub fn main() {
   let assert Ok(fake_db.Pong) =
     lifeguard.call(pool, fake_db.Ping, 1000, 1000)
 
-  // Shut down the pool
-  let assert Ok(Nil) = lifeguard.shutdown(pool)
+  // Do more stuff...
 }
 ```
 

@@ -20,7 +20,13 @@ import gleam/otp/static_supervisor as supervisor
 import lifeguard
 
 pub fn main() {
-  let pool_receiver = process.new_subject()
+  // Create a subject to receive the pool handler once the supervision tree has been
+  // started. Use a named subject to make sure we can always receive the pool handler,
+  // even if our original process crashes.
+  let pool_receiver_name = process.new_name("lifeguard_pool_receiver")
+  let assert Ok(_) = process.register(process.self(), pool_receiver_name)
+
+  let pool_receiver = process.named_subject(pool_receiver_name)
 
   // Define a pool of 10 connections to some fictional database, and create a child
   // spec to allow it to be supervised.

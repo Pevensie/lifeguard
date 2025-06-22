@@ -51,6 +51,7 @@ pub fn selecting(
 /// Configuration for a [`Pool`](#Pool).
 pub opaque type Builder(state, msg) {
   Builder(
+    name: option.Option(process.Name(PoolMsg(msg))),
     size: Int,
     checkout_strategy: CheckoutStrategy,
     init: fn(process.Subject(msg)) -> Result(Initialised(state, msg), String),
@@ -86,6 +87,7 @@ pub opaque type Builder(state, msg) {
 /// | `checkout_strategy` | `FIFO` |
 pub fn new(state: state) -> Builder(state, msg) {
   Builder(
+    name: None,
     size: 10,
     checkout_strategy: FIFO,
     init: fn(_) { Ok(initialised(state)) },
@@ -134,6 +136,7 @@ pub fn new_with_initialiser(
     Result(Initialised(state, msg), String),
 ) -> Builder(state, msg) {
   Builder(
+    name: None,
     size: 10,
     checkout_strategy: FIFO,
     init: initialiser,
@@ -159,6 +162,15 @@ pub fn size(
   Builder(..builder, size:)
 }
 
+/// Give the pool a name. This can be used to access the pool by creating a named
+/// subject.
+pub fn name(
+  builder builder: Builder(state, msg),
+  name name: option.Option(process.Name(PoolMsg(msg))),
+) -> Builder(state, msg) {
+  Builder(..builder, name:)
+}
+
 /// Set the order in which actors are checked out from the pool. Defaults to `FIFO`.
 pub fn checkout_strategy(
   builder builder: Builder(state, msg),
@@ -176,7 +188,6 @@ pub type ApplyError {
 }
 
 fn start_tree(
-  pool_name: process.Name(PoolMsg(msg)),
   builder: Builder(state, msg),
   init_timeout: Int,
 ) -> Result(actor.Started(sup.Supervisor), actor.StartError) {
@@ -198,14 +209,14 @@ fn start_tree(
     supervision.supervisor(fn() {
       list.repeat("", builder.size)
       |> list.fold(worker_supervisor, fn(worker_supervisor, _) {
-        sup.add(worker_supervisor, worker_spec(pool_name, builder))
+        sup.add(worker_supervisor, worker_spec(builder))
       })
       |> sup.start
     })
 
   // Add the pool and worker supervisors to the main supervisor
   main_supervisor
-  |> sup.add(pool_spec(builder, pool_name, init_timeout))
+  |> sup.add(pool_spec(builder, init_timeout))
   |> sup.add(worker_supervisor_spec)
   |> sup.start()
 }
@@ -219,11 +230,10 @@ fn start_tree(
 /// any of the workers fail to start.
 pub fn start(
   builder builder: Builder(state, msg),
-  named pool_name: process.Name(PoolMsg(msg)),
   timeout init_timeout: Int,
-) -> Result(Nil, actor.StartError) {
-  start_tree(pool_name, builder, init_timeout)
-  |> result.replace(Nil)
+) -> Result(sup.Supervisor, actor.StartError) {
+  start_tree(builder, init_timeout)
+  |> result.map(fn(started) { started.data })
 }
 
 /// Return the [`ChildSpecification`](https://hexdocs.pm/gleam_otp/gleam/otp/supervision.html#ChildSpecification)
@@ -570,7 +580,6 @@ fn handle_pool_message(state: State(msg), msg: PoolMsg(msg)) {
 
 fn pool_spec(
   builder: Builder(state, msg),
-  pool_name: process.Name(PoolMsg(msg)),
   init_timeout: Int,
 ) -> supervision.ChildSpecification(process.Subject(PoolMsg(msg))) {
   let pool_builder =
@@ -593,7 +602,11 @@ fn pool_spec(
       |> Ok
     })
     |> actor.on_message(handle_pool_message)
-    |> actor.named(pool_name)
+
+  let pool_builder = case builder.name {
+    Some(name) -> actor.named(pool_builder, name)
+    None -> pool_builder
+  }
 
   supervision.worker(fn() { actor.start(pool_builder) })
   |> supervision.restart(supervision.Transient)
@@ -606,13 +619,12 @@ type Worker(msg) {
 }
 
 fn worker_spec(
-  pool_name: process.Name(PoolMsg(msg)),
   builder: Builder(state, msg),
 ) -> supervision.ChildSpecification(process.Subject(msg)) {
   let worker_builder =
     actor.new_with_initialiser(builder.init_timeout, fn(self) {
       // Check in the worker
-      process.send(process.named_subject(pool_name), Register(self))
+      process.send(process.named_subject(builder.name), Register(self))
 
       use init_data <- result.try(builder.init(self))
 

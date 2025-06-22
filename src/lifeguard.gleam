@@ -65,13 +65,18 @@ pub opaque type Builder(state, msg) {
 /// This API mimics the Actor API from [`gleam/otp/actor`](https://hexdocs.pm/gleam_otp/gleam/otp/actor.html),
 /// so it should be familiar to anyone already using OTP with Gleam.
 ///
+/// You must provide a name for the pool. You can then send messages to the pool by
+/// creating a named subject with this name.
+///
 /// ```gleam
 /// import lifeguard
 ///
 /// pub fn main() {
+///   let pool_name = process.new_name("pool")
+///
 ///   // Create a pool of 10 actors that do nothing.
 ///   let assert Ok(pool) =
-///     lifeguard.new(initial_state)
+///     lifeguard.new(pool_name, initial_state)
 ///     |> lifeguard.on_message(fn(msg, state) { actor.continue(state) })
 ///     |> lifeguard.size(10)
 ///     |> lifeguard.start(1000)
@@ -102,7 +107,10 @@ pub fn new(
 /// Create a new [`Builder`](#Builder) with a custom initialiser that runs before the
 /// worker's message loop starts.
 ///
-/// The first argument is the number of milliseconds the initialiser is expected to
+/// You must provide a name for the pool. You can then send messages to the pool by
+/// creating a named subject with this name.
+///
+/// The second argument is the number of milliseconds the initialiser is expected to
 /// return within. The actor will be terminated if it does not complete within the
 /// specified time, and the creation of the pool will fail.
 ///
@@ -112,19 +120,6 @@ pub fn new(
 ///
 /// This API mimics the Actor API from [`gleam/otp/actor`](https://hexdocs.pm/gleam_otp/gleam/otp/actor.html),
 /// so it should be familiar to anyone already using OTP with Gleam.
-///
-/// ```gleam
-/// import lifeguard
-///
-/// pub fn main() {
-///   // Create a pool of 10 actors that do nothing.
-///   let assert Ok(pool) =
-///     lifeguard.new(initial_state)
-///     |> lifeguard.on_message(fn(msg, state) { actor.continue(state) })
-///     |> lifeguard.size(10)
-///     |> lifeguard.start(1000)
-/// }
-/// ```
 ///
 /// ### Default values
 ///
@@ -233,9 +228,6 @@ pub fn start(
 
 /// Return the [`ChildSpecification`](https://hexdocs.pm/gleam_otp/gleam/otp/supervision.html#ChildSpecification)
 /// for creating a supervised worker pool.
-///
-/// You must provide a name for the pool. You can then send messages to the pool by
-/// creating a named subject with this name.
 ///
 /// ## Example
 ///

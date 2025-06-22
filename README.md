@@ -27,7 +27,7 @@ pub fn main() {
   // Define a pool of 10 connections to some fictional database, and create a child
   // spec to allow it to be supervised.
   let lifeguard_child_spec =
-    lifeguard.new(fake_db.get_conn())
+    lifeguard.new(pool_name, fake_db.get_conn())
     |> lifeguard.on_message(fn(state, msg) {
         case msg {
           fake_db.Ping(reply_to:) -> {
@@ -38,7 +38,7 @@ pub fn main() {
         }
       })
     |> lifeguard.size(10)
-    |> lifeguard.supervised(pool_name, 1000)
+    |> lifeguard.supervised(1000)
 
   // Start the pool under a supervisor
   let assert Ok(_started) =

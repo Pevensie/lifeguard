@@ -51,7 +51,7 @@ pub fn selecting(
 /// Configuration for a [`Pool`](#Pool).
 pub opaque type Builder(state, msg) {
   Builder(
-    name: option.Option(process.Name(PoolMsg(msg))),
+    name: process.Name(PoolMsg(msg)),
     size: Int,
     checkout_strategy: CheckoutStrategy,
     init: fn(process.Subject(msg)) -> Result(Initialised(state, msg), String),
@@ -85,9 +85,12 @@ pub opaque type Builder(state, msg) {
 /// | `on_message` | `fn(state, _) { actor.continue(state) }` |
 /// | `size`   | 10      |
 /// | `checkout_strategy` | `FIFO` |
-pub fn new(state: state) -> Builder(state, msg) {
+pub fn new(
+  name: process.Name(PoolMsg(msg)),
+  state: state,
+) -> Builder(state, msg) {
   Builder(
-    name: None,
+    name:,
     size: 10,
     checkout_strategy: FIFO,
     init: fn(_) { Ok(initialised(state)) },
@@ -131,12 +134,13 @@ pub fn new(state: state) -> Builder(state, msg) {
 /// | `size`   | 10      |
 /// | `checkout_strategy` | `FIFO` |
 pub fn new_with_initialiser(
+  name: process.Name(PoolMsg(msg)),
   timeout: Int,
   initialiser: fn(process.Subject(msg)) ->
     Result(Initialised(state, msg), String),
 ) -> Builder(state, msg) {
   Builder(
-    name: None,
+    name:,
     size: 10,
     checkout_strategy: FIFO,
     init: initialiser,
@@ -160,15 +164,6 @@ pub fn size(
   size size: Int,
 ) -> Builder(state, msg) {
   Builder(..builder, size:)
-}
-
-/// Give the pool a name. This can be used to access the pool by creating a named
-/// subject.
-pub fn name(
-  builder builder: Builder(state, msg),
-  name name: option.Option(process.Name(PoolMsg(msg))),
-) -> Builder(state, msg) {
-  Builder(..builder, name:)
 }
 
 /// Set the order in which actors are checked out from the pool. Defaults to `FIFO`.
@@ -252,8 +247,8 @@ pub fn start(
 /// let assert Ok(_started) =
 ///   supervisor.new(supervisor.OneForOne)
 ///   |> supervisor.add(
-///     lifeguard.new(state)
-///     |> lifeguard.supervised(pool_name, 1000)
+///     lifeguard.new(pool_name, state)
+///     |> lifeguard.supervised(1000)
 ///   )
 ///   |> supervisor.start
 ///
@@ -263,10 +258,9 @@ pub fn start(
 /// ```
 pub fn supervised(
   builder builder: Builder(state, msg),
-  named pool_name: process.Name(PoolMsg(msg)),
   timeout init_timeout: Int,
 ) -> supervision.ChildSpecification(sup.Supervisor) {
-  supervision.supervisor(fn() { start_tree(pool_name, builder, init_timeout) })
+  supervision.supervisor(fn() { start_tree(builder, init_timeout) })
 }
 
 /// Get the supervisor PID for a running pool.
@@ -602,11 +596,7 @@ fn pool_spec(
       |> Ok
     })
     |> actor.on_message(handle_pool_message)
-
-  let pool_builder = case builder.name {
-    Some(name) -> actor.named(pool_builder, name)
-    None -> pool_builder
-  }
+    |> actor.named(builder.name)
 
   supervision.worker(fn() { actor.start(pool_builder) })
   |> supervision.restart(supervision.Transient)

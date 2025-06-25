@@ -1,5 +1,10 @@
 # Changelog
 
+## v4.0.0 - 2025-06-25
+
+- Accept pool names rather than creating them internally. This should help prevent atom
+  leaks.
+
 ## v3.0.0 - 2025-06-13
 
 Lifeguard has been updated to use the new stable versions of `gleam/erlang` and

@@ -21,7 +21,8 @@ import lifeguard
 
 pub fn main() {
   // Create a name for the pool. We can use this to send messages to the pool once it
-  // has been started.
+  // has been started. Remember, you should always create names _outside_ your
+  // supervision tree to avoid leaking atoms.
   let pool_name = process.new_name("db_connection_pool")
 
   // Define a pool of 10 connections to some fictional database, and create a child
